@@ -1,0 +1,456 @@
+const version = "1.2.1";
+
+const weakScript = "doWeaken.ns";
+const growScript = "doGrow.ns";
+const hackScript = "doHack.ns";
+const remoteScripts = [weakScript, growScript, hackScript];
+let scriptRam = new Map();
+
+let restrictedServers = ["home", "darknet"]; // Servers not to hack
+let capacities = new Map(); // What proportion of each server to use (default 1.0)
+capacities.set("home", 0.6);
+let knownRam = new Map(); 
+
+let depth = 1;
+let silent = false;
+let greedy = false;
+let veryGreedy = false;
+
+const loopTime = 100; // The minimum time each loop should take.
+const checkTime = 120 * 1000; // How often to check the state of connected servers.
+
+const weakenTolerance = 5;
+const growTolerance = 0.75;
+const hackTolerance = 0.15;
+const actionTolerance = 1.05;
+
+
+/**
+ * Logs a message, printing it to the screen only if silent mode is false. 
+ * @param {NS} ns
+ * @param {String} msg
+ */
+function logMessage(ns, msg) {
+	if (!silent) {
+		ns.tprint(`[Version ${version}] ` + msg);
+	}
+	ns.print(msg);
+}
+
+
+/**
+ * Toasts a message, adding it to the event list if silent mode is false. 
+ * @param {NS} ns
+ * @param {String} msg
+ */
+function toastMessage(ns, msg) {
+	if (!silent) {
+		ns.toast(`[Version ${version}] ` + msg);
+	}
+}
+
+
+/**
+ * Gets the current time as a timestamp in milliseconds.
+ * @returns {Number} Current timestamp in milliseconds
+ */
+function getCurrentTime() {
+	return new Date().getTime();
+}
+
+
+/**
+ * Parses arguments input in the function call to set relevant values used by the program.
+ * @param {NS} ns
+ */
+function parseArgs(ns) {
+	var argNum = 0;
+	if (ns.args.length <= argNum) {return;} 
+	else {
+		depth = ns.args[argNum];
+	}
+	argNum++;
+	if (ns.args.length <= argNum) {return;} 
+	else {
+		silent = ns.args[argNum];
+	}
+	argNum++;
+	if (ns.args.length <= argNum) {return;}
+	else {
+		greedy = ns.args[argNum];
+	}
+	argNum++;
+	if (ns.args.length <= argNum) {return;}
+	else {
+		veryGreedy = ns.args[argNum];
+	}
+	argNum++;
+}
+
+
+/**
+ * Gets all servers connected to the current server within a certain depth using a breadth-
+ * first search strategy.
+ * @param {NS} ns
+ * @returns {String[]} A list of the host name of all found servers.
+ */
+function getServers(ns) {
+	var servers = [ns.getHostname()];
+	var frontier = servers;
+	// Perform `depth` iterations.
+	for (var i = 0; i < depth; i++) {
+		// For each server in the previous frontier, scan for new servers. 
+		var newFrontier = [];
+		for (var j = 0; j < frontier.length; j++) {
+			var scanned = ns.scan(frontier[j], true);
+			// For each scanned server, add it to the list of servers and the new frontier if it is new.
+			for (var k = 0; k < scanned.length; k++) {
+				let server = scanned[k];
+				if (!restrictedServers.includes(server) && !servers.includes(server)) {
+					servers.push(server);
+					newFrontier.push(server);
+				}
+			}
+		}
+		// If new servers were scanned, continue with the new frontier, otherwise, stop.
+		if (newFrontier.length == 0) {
+			break;
+		}
+		frontier = newFrontier;
+	}
+	// Return the list of all scanned servers.
+	return servers;
+}
+
+
+/**
+ * Installs any required remote scripts that are not installed on the given server.
+ * @param {NS} ns
+ * @param {String} server
+ */
+async function installRequiredScripts(ns, server) {
+	for (var i = 0; i < remoteScripts.length; i++) {
+		var script = remoteScripts[i];
+		if (!ns.fileExists(script, server)) {
+			await ns.scp(script, "home", server);
+		}
+	}
+}
+
+
+/**
+ * Attempts to open the ports of all listed servers and nuke them to gain root access. This also
+ * sets them up for hacking, by ensuring the required remote scripts are installed on rooted servers.
+ * @param {NS} ns
+ * @param {String[]} servers
+ * @returns {String[]} valid, rooted servers.
+ */
+async function tryRootServers(ns, servers) {
+	var rootedServers = [];
+	for (var i = 0; i < servers.length; i++) {
+		var server = servers[i];
+		if (ns.hasRootAccess(server)) {
+			// If we already have root access, just check the required remote scripts are installed.
+			await installRequiredScripts(ns, server);
+			rootedServers.push(server);
+		} else if (ns.getServerRequiredHackingLevel(server) <= ns.getHackingLevel()) {
+			// If we do not yet have root access, try all methods of opening ports
+			if (ns.fileExists("bruteSSH", "home")) {
+				ns.brutessh(server);
+			}
+			if (ns.fileExists("FTPCrack.exe", "home")) {
+				ns.ftpcrack(server);
+			}
+			if (ns.fileExists("relaySMTP.exe", "home")) {
+				ns.relaysmtp(server);
+			}
+			if (ns.fileExists("HTTPWorm.exe", "home")) {
+				ns.httpworm(server);
+			}
+			if (ns.fileExists("SQLInject.exe", "home")) {
+				ns.sqlinject(server);
+			}
+			// Then, check if we have enough ports open - if so, gain root access and install the required remote scripts.
+			let openPorts = ns.getServer(server).openPortCount;
+			let requiredPorts = ns.getServerNumPortsRequired(server);
+			if (openPorts >= requiredPorts) {
+				ns.nuke(server);
+				await installRequiredScripts(ns, server);
+				rootedServers.push(server);
+			}
+		}
+	}
+	logMessage(ns, `Successfully gained root access to ${rootedServers.length}/${servers.length} available servers.`);
+	return rootedServers;
+}
+
+
+/**
+ * Gets the amount of RAM available on every given server.
+ * @param {NS} ns
+ * @param {Map} availableRam - an existing availableRam Map, or null.
+ * @param {String[]} servers
+ * @returns {Map} available RAM for each server, in the same order as given.
+ */
+function getAvailableRam(ns, availableRam, servers) {
+	if (availableRam == null) {
+		availableRam = new Map();
+	}
+	// Determine which servers are new by whether we have a known max RAM value recorded
+	var newServers = [];
+	for (var i = 0; i < servers.length; i++) {
+		var server = servers[i];
+		if (availableRam.get(server) === undefined) {
+			newServers.push(server);
+		}
+	}
+	for (var i = 0; i < servers.length; i++) {
+		// Determine each servers capacities.
+		var server = servers[i];
+		var capacity = 1.0;
+		var specifiedCapacity = capacities.get(server);
+		if (specifiedCapacity !== undefined) {
+			capacity = specifiedCapacity;
+		}
+		if (newServers.includes(server)) {
+			// If the server is new, record its known and available RAM values.
+			knownRam.set(server, ns.getServerMaxRam(server));
+			availableRam.set(server, ns.getServerMaxRam(server) * capacity - ns.getServerUsedRam(server));
+		} else {
+			// If the server is not new, check its current max RAM - if changed, update its known and available RAM values accordingly.
+			var currentRam = knownRam.get(server);
+			var newRam = ns.getServerMaxRam(server);
+			if (currentRam != newRam) {
+				knownRam.set(server, newRam);
+				availableRam.set(server, availableRam.get(server) - currentRam + newRam);
+			}
+		}
+	}
+	return availableRam;
+}
+
+
+/**
+ * Gets the list of target servers to hack from a list of rooted servers, returning them
+ * in order of precedence to hack for optimum exploitation. Also calculates the
+ * money and security thresholds for each target.
+ * @param {NS} ns
+ * @param {String[]} servers
+ * @returns {String[]} targets, ordered by optimality.
+ */
+function getTargets(ns, servers) {
+	var heuristicInfo = [];
+	for (var i = 0; i < servers.length; i++) {
+		var server = servers[i];
+		var maxMoney = ns.getServerMaxMoney(server);
+		if (restrictedServers.includes(server) || maxMoney == 0) {
+			continue;
+		}
+		if (greedy) {
+			var heuristicVal = (maxMoney + ns.getServerMoneyAvailable(server))
+		} else {
+			var heuristicVal = maxMoney;
+		}
+		heuristicVal /= (ns.getHackTime(server) + (ns.getGrowTime(server) / ns.getServerGrowth(server)) + ns.getWeakenTime(server));
+		heuristicInfo.push([heuristicVal, server]);
+	}
+	// Sort targets by descending heuristic value for optimal ordering.
+	heuristicInfo.sort(function(a, b) {
+		return b[0] - a[0];
+	});
+	// Return only the list of targets, removing the heuristic values and adding calculated thresholds
+	return heuristicInfo.map(function(h) {
+		var target = h[1];
+		var moneyThresh = ns.getServerMaxMoney(target) * growTolerance;
+		var securityThresh = ns.getServerMinSecurityLevel(target) + weakenTolerance;
+		return [target, moneyThresh, securityThresh];
+	});
+}
+
+
+/** 
+ * @param {NS} ns 
+ *    > {int} arg1 = depth to BFS search for servers
+ *    > {boolean} arg2 = silent mode (no terminal messages or toasts, only log messages).
+ *    > {boolean} arg3 = greedy mode (prioritise servers with available money, even if not the best)
+ *    > {boolean} arg4 = very greedy mode (always hack, never grow/weaken - 'I need money now')
+ **/
+export async function main(ns) {
+	// Check required information exists before running
+	for (var i = 0; i < remoteScripts.length; i++) {
+		var script = remoteScripts[i];
+		if (!ns.fileExists(script, "home")) {
+			logMessage(ns, `Required script ${script} not found in home.`);
+			return;
+		}
+	}
+	// Startup functionality
+	for (let i = 0; i < remoteScripts.length; i++) {
+		let script = remoteScripts[i];
+		scriptRam.set(script, ns.getScriptRam(script));
+	}
+	parseArgs(ns);
+	logMessage(ns, "Started managing system.");
+
+	var prevTime = 0;
+	var timeLastChecked = 0;
+	var rootedServers = [];
+	var availableRam = new Map();
+	var targets = []; // Each item is [targetname, moneyThreshold, securityThreshold]
+	var targetInfo = new Map(); // Each key is a target and each value is [script, requiredScripts, ranScripts, finishedScripts]
+	var runCount = 0;
+	var runningScripts = [];
+	// Infinite loop of required processing.
+	while (true) {
+		// Sleep to match appropriate loop time
+		let currTime = getCurrentTime();
+		let timePassed = currTime - prevTime;
+		if (timePassed < loopTime) {
+			await ns.sleep(loopTime - timePassed);
+			currTime = getCurrentTime();
+			prevTime = currTime
+		} else {
+			prevTime = currTime;
+		}
+		// Check for and record finished scripts
+		for (let i = runningScripts.length - 1; i >= 0; i--) {
+			let info = runningScripts[i];
+			let server = info[0];
+			let runThreads = info[1];
+			let script = info[2];
+			let target = info[3];
+			let runCount = info[4];
+			if (!ns.isRunning(script, server, target, runCount)) {
+				let targetStats = targetInfo.get(target);
+				let requiredScripts = targetStats[1];
+				let ranScripts = targetStats[2];
+				let finishedScripts = targetStats[3] + runThreads;
+				if (requiredScripts == ranScripts && ranScripts == finishedScripts) {
+					targetInfo.set(target, ["", 0, 0, 0]);
+				} else {
+					targetInfo.set(target, [script, requiredScripts, ranScripts, finishedScripts]);
+				}
+				availableRam.set(server, availableRam.get(server) + scriptRam.get(script) * runThreads);
+				runningScripts.splice(i, 1);
+			}
+		}
+		// Check whether to scan for new servers.
+		let timeSinceLastCheck = currTime - timeLastChecked;
+		if (timeSinceLastCheck > checkTime || ns.isRunning("flag-hack-update.ns", "home")) {
+			// Scan for new servers and update respective information.
+			timeLastChecked = currTime;
+			let servers = getServers(ns);
+			rootedServers = await tryRootServers(ns, servers);
+			toastMessage(ns, `Found ${rootedServers.length} servers to manage.`);
+			logMessage(ns, `Found ${rootedServers.length} servers to manage.`);
+			availableRam = getAvailableRam(ns, availableRam, rootedServers);
+		}
+		/*var strToPrint = "";
+		for (let i = 0; i < rootedServers.length; i++) {
+			strToPrint = strToPrint.concat(`(${rootedServers[i]}: ${availableRam.get(rootedServers[i])}), `);
+		}
+		ns.tprint(strToPrint);*/  // TODO LOGGING REMOVE
+		// Compute best target ordering and relevant threshold information
+		targets = getTargets(ns, rootedServers);
+		// Find the scripts to run on the retrieved targets
+		var currentTarget = 0;
+		var scriptInfo = [];
+		while (currentTarget < targets.length) {
+			// Parse target information
+			let targetCalcs = targets[currentTarget];
+			let target = targetCalcs[0];
+			let moneyThresh = targetCalcs[1];
+			let securityThresh = targetCalcs[2];
+			// Check whether target analysis is actually needed
+			let targetStats = targetInfo.get(target);
+			if (targetStats === undefined) {
+				targetStats = ["", 0, 0, 0];
+				targetInfo.set(target, targetStats);
+			}
+			let script = targetStats[0];
+			let requiredScripts = targetStats[1];
+			let ranScripts = targetStats[2];
+			let finishedScripts = targetStats[3];
+			if (requiredScripts != 0) {
+				// If the number of required scripts it already calculated but the target is not saturated, queue leftover scripts.
+				if (ranScripts != requiredScripts) {
+					scriptInfo.push([target, script, requiredScripts - ranScripts]);
+				}
+				currentTarget++;
+				continue;
+			}
+			// If the number of required scripts is not yet calculated, calculate and enqueue them.
+			let toRun = 0;
+			// Check security and money levels to determine whether to weaken, grow or hack the target, and using how many threads.
+			let securityLevel = ns.getServerSecurityLevel(target);
+			let moneyAvailable = ns.getServerMoneyAvailable(target);
+			if (securityLevel > securityThresh && !veryGreedy) {
+				let securityDiff = securityLevel - securityThresh;
+				toRun = Math.ceil(securityDiff * actionTolerance / 0.05);
+				script = weakScript;
+			} else if (moneyAvailable < moneyThresh && !veryGreedy) {
+				if (moneyAvailable == 0) {
+					// If we have no money, the best estimate we have for required growth is 1 script for $500.
+					toRun = Math.ceil(moneyThresh / 500);
+				} else {
+					let requiredGrowth = moneyThresh / moneyAvailable; // TODO growthAnalyze takes cores???
+					toRun = Math.ceil(ns.growthAnalyze(target, requiredGrowth, 1) * actionTolerance);
+				}
+				script = growScript;
+			} else {
+				let percentToHack = moneyAvailable / ns.getServerMaxMoney(target) - hackTolerance;
+				toRun = Math.ceil(actionTolerance * 1.5 * percentToHack / (ns.hackAnalyze(target) * ns.hackAnalyzeChance(target))); // TODO lmao what actually is this estimate???
+				script = hackScript;
+			}
+			if (toRun > 0) {
+				targetInfo.set(target, [script, toRun, 0, 0]); // Record calculated values
+				scriptInfo.push([target, script, toRun]); // Enqueue required scripts
+			}
+			currentTarget++;
+		}
+		// Run target scripts on available servers
+		let currentScript = 0;
+		let ranThreadCount = 0; 
+		for (let i = 0; i < rootedServers.length; i++) {
+			if (currentScript >= scriptInfo.length) {
+				break;
+			}
+			let failure = false;
+			let server = rootedServers[i];
+			let script = scriptInfo[currentScript][1];
+			// For each server, keep handling target scripts until no space is left or all scripts are handled.
+			while (availableRam.get(server) >= scriptRam.get(script) && !failure && scriptInfo.length > 0 && currentScript < scriptInfo.length) {
+				let scriptToRun = scriptInfo[currentScript];
+				let target = scriptToRun[0];
+				script = scriptToRun[1];
+				// Find the number of threads to run on the server
+				let targetThreads = scriptToRun[2];
+				let remainingThreads = targetThreads - ranThreadCount;
+				let maxThreads = Math.floor(availableRam.get(server) / scriptRam.get(script));
+				let runThreads = Math.min(remainingThreads, maxThreads);
+				// Attempt to run the script.
+				if (ns.exec(script, server, runThreads, target, runCount) > 0) {
+					// Update the amount of available RAM, list of running scripts, counts of running scripts, saturation status and more.
+					ranThreadCount += runThreads;
+					availableRam.set(server, availableRam.get(server) - scriptRam.get(script) * runThreads);
+					runningScripts.push([server, runThreads, script, target, runCount]);
+					let targetStats = targetInfo.get(target);
+					script = targetStats[0];
+					let requiredScripts = targetStats[1];
+					let ranScripts = targetStats[2] + runThreads;
+					let finishedScripts = targetStats[3];
+					targetInfo.set(target, [script, requiredScripts, ranScripts, finishedScripts]);
+					if (ranScripts == requiredScripts) { // We have ran the target number of scripts, so move on to the next target
+						currentScript++;
+						ranThreadCount = 0;
+					}
+					runCount++;
+				} else {
+					// Record and log failure
+					failure = true;
+					logMessage(ns, `Script execution failure: ${server} to exec ${script} ${target} ${runCount} with ${runThreads} threads. Expected RAM = ${availableRam.get(server)}GB, actual RAM = ${ns.getServerMaxRam(server) - ns.getServerUsedRam(server)}GB. Running ${ns.ps(server).length} processes: ${ns.ps(server).map(toString).join(", ")}`);
+				}
+			}
+		}
+	}
+}

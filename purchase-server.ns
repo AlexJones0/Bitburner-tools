@@ -1,0 +1,18 @@
+/** @param {NS} ns **/
+export async function main(ns) {
+    if (ns.args.length == 0) {
+        var size = 16;
+    } else {
+        var size = ns.args[0];
+    }
+    let connected = ns.scan("home", true);
+    let count = 0;
+    for (let i = 0; i < connected.length; i++) {
+        let server = connected[i];
+        if (server.startsWith("server-")) {
+            count++;
+        }
+    }
+    count++;
+    ns.purchaseServer(`server-${count.toString()}-${size.toString()}`, size);
+}

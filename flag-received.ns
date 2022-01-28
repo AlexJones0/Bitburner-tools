@@ -1,0 +1,22 @@
+/** @param {NS} ns **/
+export async function main(ns) {
+    let sleepTime = 50; // mSec
+    if (ns.args.length == 0) {
+        return;
+    }
+    let flagScript = ns.args[0];
+    let scriptIsRunning = true;
+    while (scriptIsRunning) {
+        // Search for the script (using ps rather than isRunning to avoid checking argument values)
+        scriptIsRunning = false;
+		let runningProcesses = ns.ps("home");
+		for (let i = 0; i < runningProcesses.length; i++) {
+			let process = runningProcesses[i];
+			if (process.filename == flagScript) {
+				scriptIsRunning = true;
+				break;
+			}
+		}
+        await ns.sleep(sleepTime);
+    }
+}

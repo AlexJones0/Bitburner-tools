@@ -1,0 +1,7 @@
+/** @param {NS} ns **/
+export async function main(ns) {
+    let sleepTime = 50; // mSec
+    while (!ns.isRunning("flag-received.ns", "home", "flag-sys-update.ns")) {
+        await ns.sleep(sleepTime);
+    }
+}

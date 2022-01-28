@@ -1,0 +1,1066 @@
+// TODO - add flag received asynchronous faeture for proper flag handling?
+// TODO - how do I handle the RAM/scripts of lost servers?
+// TODO - incorporate Formulas API for more accurate values (hack times for heuristics, required threads, etc., and implement them as alternatives)
+// 		  only if the Formulas API exists on home.
+
+const version = "2.3.3";
+
+const weakScript = "doWeaken.ns";
+const growScript = "doGrow.ns";
+const hackScript = "doHack.ns";
+const remoteScripts = [weakScript, growScript, hackScript];
+const requiredScripts = remoteScripts.concat(["flag-sys-update.ns", "flag-sys-settings.ns", "flag-sys-end.ns", "flag-received.ns"])
+let scriptRam = new Map();
+
+let restrictedServers = ["home", "darknet"]; // Servers not to hack
+let capacities = new Map(); // What proportion of each server to use (default 1.0)
+capacities.set("home", 0.6);
+let knownRam = new Map(); 
+
+let depth = 50;
+let silent = true;
+let greedy = false;
+let veryGreedy = false;
+
+const loopTime = 100; // The minimum time each loop should take.
+const checkTime = 120 * 1000; // How often to check the state of connected servers.
+
+const weakenTolerance = 5;
+const growTolerance = 0.8;
+const hackTolerance = 0.4;
+const actionTolerance = 1.05;
+const ramTolerance = 0.05;
+
+var failedContracts = []; // Keep a list of failed contracts so we don't do them again.
+
+
+/**
+ * Logs a message, printing it to the screen only if silent mode is false. 
+ * @param {NS} ns
+ * @param {String} msg
+ */
+function logMessage(ns, msg) {
+	if (!silent) {
+		ns.tprint(`[Version ${version}] ` + msg);
+	}
+	ns.print(msg);
+}
+
+
+/**
+ * Toasts a message, adding it to the event list if silent mode is false. 
+ * @param {NS} ns
+ * @param {String} msg
+ */
+function toastMessage(ns, msg) {
+	if (!silent) {
+		ns.toast(`[Version ${version}] ` + msg);
+	}
+}
+
+
+/**
+ * Gets the current time as a timestamp in milliseconds.
+ * @returns {Number} Current timestamp in milliseconds
+ */
+function getCurrentTime() {
+	return new Date().getTime();
+}
+
+
+/**
+ * Parses arguments input in the function call to set relevant values used by the program.
+ * @param {Any[]} args
+ */
+function parseArgs(args) {
+	var argNum = 0;
+	if (args.length <= argNum) {return;} 
+	else if (args[argNum] != "keep") {
+		depth = args[argNum];
+	}
+	argNum++;
+	if (args.length <= argNum) {return;} 
+	else if (args[argNum] != "keep") {
+		silent = args[argNum];
+	}
+	argNum++;
+	if (args.length <= argNum) {return;} 
+	else if (args[argNum] != "keep") {
+		greedy = args[argNum];
+	}
+	argNum++;
+	if (args.length <= argNum) {return;} 
+	else if (args[argNum] != "keep") {
+		veryGreedy = args[argNum];
+	}
+	argNum++;
+}
+
+
+/**
+ * Gets all servers connected to the current server within a certain depth using a breadth-
+ * first search strategy.
+ * @param {NS} ns
+ * @returns {String[]} A list of the host name of all found servers.
+ */
+function getServers(ns) {
+	var servers = [ns.getHostname()];
+	var frontier = servers;
+	// Perform `depth` iterations.
+	for (var i = 0; i < depth; i++) {
+		// For each server in the previous frontier, scan for new servers. 
+		var newFrontier = [];
+		for (var j = 0; j < frontier.length; j++) {
+			var scanned = ns.scan(frontier[j], true);
+			// For each scanned server, add it to the list of servers and the new frontier if it is new.
+			for (var k = 0; k < scanned.length; k++) {
+				let server = scanned[k];
+				if (!restrictedServers.includes(server) && !servers.includes(server)) {
+					servers.push(server);
+					newFrontier.push(server);
+				}
+			}
+		}
+		// If new servers were scanned, continue with the new frontier, otherwise, stop.
+		if (newFrontier.length == 0) {
+			break;
+		}
+		frontier = newFrontier;
+	}
+	// Return the list of all scanned servers.
+	return servers;
+}
+
+
+/**
+ * Installs any required remote scripts that are not installed on the given server.
+ * @param {NS} ns
+ * @param {String} server
+ */
+async function installRequiredScripts(ns, server) {
+	for (var i = 0; i < remoteScripts.length; i++) {
+		var script = remoteScripts[i];
+		if (!ns.fileExists(script, server)) {
+			await ns.scp(script, "home", server);
+		}
+	}
+}
+
+
+/**
+ * Attempts to open the ports of all listed servers and nuke them to gain root access. This also
+ * sets them up for hacking, by ensuring the required remote scripts are installed on rooted servers.
+ * @param {NS} ns
+ * @param {String[]} servers
+ * @returns {String[]} valid, rooted servers.
+ */
+async function tryRootServers(ns, servers) {
+	var rootedServers = [];
+	for (var i = 0; i < servers.length; i++) {
+		var server = servers[i];
+		if (ns.hasRootAccess(server)) {
+			// If we already have root access, just check the required remote scripts are installed.
+			await installRequiredScripts(ns, server);
+			rootedServers.push(server);
+		} else if (ns.getServerRequiredHackingLevel(server) <= ns.getHackingLevel()) {
+			// If we do not yet have root access, try all methods of opening ports
+			if (ns.fileExists("bruteSSH.exe", "home")) {
+				ns.brutessh(server);
+			}
+			if (ns.fileExists("FTPCrack.exe", "home")) {
+				ns.ftpcrack(server);
+			}
+			if (ns.fileExists("relaySMTP.exe", "home")) {
+				ns.relaysmtp(server);
+			}
+			if (ns.fileExists("HTTPWorm.exe", "home")) {
+				ns.httpworm(server);
+			}
+			if (ns.fileExists("SQLInject.exe", "home")) {
+				ns.sqlinject(server);
+			}
+			// Then, check if we have enough ports open - if so, gain root access and install the required remote scripts.
+			let openPorts = ns.getServer(server).openPortCount;
+			let requiredPorts = ns.getServerNumPortsRequired(server);
+			if (openPorts >= requiredPorts) {
+				ns.nuke(server);
+				await installRequiredScripts(ns, server);
+				rootedServers.push(server);
+				logMessage(ns, `INFO - Gained root access to new server ${server}.`)
+			}
+		}
+	}
+	logMessage(ns, `INFO - Successfully gained root access to ${rootedServers.length}/${servers.length} available servers.`);
+	return rootedServers;
+}
+
+
+/**
+ * Gets the amount of RAM available on every given server.
+ * @param {NS} ns
+ * @param {Map} availableRam - an existing availableRam Map, or null.
+ * @param {String[]} servers
+ * @returns {Map} available RAM for each server, in the same order as given.
+ */
+function getAvailableRam(ns, availableRam, servers) {
+	if (availableRam == null) {
+		availableRam = new Map();
+	}
+	// Determine which servers are new by whether we have a known max RAM value recorded
+	var newServers = [];
+	for (var i = 0; i < servers.length; i++) {
+		var server = servers[i];
+		if (availableRam.get(server) === undefined) {
+			newServers.push(server);
+		}
+	}
+	for (var i = 0; i < servers.length; i++) {
+		// Determine each servers capacities.
+		var server = servers[i];
+		var capacity = 1.0;
+		var specifiedCapacity = capacities.get(server);
+		if (specifiedCapacity !== undefined) {
+			capacity = specifiedCapacity;
+		}
+		if (newServers.includes(server)) {
+			// If the server is new, record its known and available RAM values.
+			knownRam.set(server, ns.getServerMaxRam(server));
+			availableRam.set(server, ns.getServerMaxRam(server) * capacity - ns.getServerUsedRam(server));
+		} else {
+			// If the server is not new, check its current max RAM - if changed, update its known and available RAM values accordingly.
+			var currentRam = knownRam.get(server);
+			var newRam = ns.getServerMaxRam(server);
+			if (currentRam != newRam) {
+				logMessage(ns, `INFO - Foudn updated RAM size of ${newRam}GB for server ${server}.`);
+				knownRam.set(server, newRam);
+				availableRam.set(server, availableRam.get(server) - currentRam + newRam);
+			}
+		}
+	}
+	return availableRam;
+}
+
+
+/**
+ * Gets the list of target servers to hack from a list of rooted servers, returning them
+ * in order of precedence to hack for optimum exploitation. Also calculates the
+ * money and security thresholds for each target.
+ * @param {NS} ns
+ * @param {String[]} servers
+ * @returns {String[]} targets, ordered by optimality.
+ */
+function getTargets(ns, servers) {
+	var heuristicInfo = [];
+	for (var i = 0; i < servers.length; i++) {
+		var server = servers[i];
+		var maxMoney = ns.getServerMaxMoney(server);
+		if (restrictedServers.includes(server) || maxMoney == 0) {
+			continue;
+		}
+		if (greedy) {
+			var heuristicVal = (maxMoney + ns.getServerMoneyAvailable(server))
+		} else {
+			var heuristicVal = maxMoney;
+		}
+		heuristicVal /= (ns.getHackTime(server) + (ns.getGrowTime(server) / ns.getServerGrowth(server)) + ns.getWeakenTime(server));
+		heuristicInfo.push([heuristicVal, server]);
+	}
+	// Sort targets by descending heuristic value for optimal ordering.
+	heuristicInfo.sort(function(a, b) {
+		return b[0] - a[0];
+	});
+	// Return only the list of targets, removing the heuristic values and adding calculated thresholds
+	return heuristicInfo.map(function(h) {
+		var target = h[1];
+		var moneyThresh = ns.getServerMaxMoney(target) * growTolerance;
+		var securityThresh = ns.getServerMinSecurityLevel(target) + weakenTolerance;
+		return [target, moneyThresh, securityThresh];
+	});
+}
+
+
+/**
+ * Solves a generic "Algorithmic Stock Trader I/II/III/IV" contract problem
+ * @param {Number} maxTrades The maximum number of transactions that can be made.
+ * @param {Number[]} stockPrices The prices of the stock for each day.
+ * @return {Number} The maximum amount of money that can be made by trading stocks.
+ */
+function solveMaxStockProfit(maxTrades, stockPrices) {
+	// Dynamic Programming Approach, O(n^2 * m)
+	var highestProfit = [];
+	for (var i = 0; i <= maxTrades; i++) {
+		var innerArr = [];
+		for (var j = 0; j <= stockPrices.length; j++) {
+			innerArr.push(0);
+		}
+		highestProfit.push(innerArr);
+	}
+	for (var i = 1; i < highestProfit.length; i++) {
+		for (var j = 1; j < highestProfit[0].length; j++) { // Buy
+			for (var k = j; k < highestProfit[0].length; k++) { // Sell
+				highestProfit[i][k] = Math.max(highestProfit[i][k], highestProfit[i - 1][k], highestProfit[i][k - 1], highestProfit[i - 1][j - 1] + stockPrices[k-1] - stockPrices[j-1]);
+			}
+		}
+	}
+	return highestProfit[maxTrades][stockPrices.length];
+}
+
+
+/**
+ * Solves a "Minimum Path Sum in a Triangle" contract problem
+ * @param {Number[][]} grid The triangle grid to find a path through
+ * @return Number The minimum path sum value.
+ */
+function solveMinimumTrianglePath(grid) {
+	// Dynamic Programming Approach, O(n) // O(n^2)
+	var M = [grid[0]];
+	for (var i = 1; i < grid.length; i++) {
+		var innerArr = [];
+		for (var j = 0; j < grid[i].length; j++) {
+			if (j == i) { // Right-most item
+				innerArr.push(M[i-1][j-1] + grid[i][j]);
+			} else if (j == 0) { // Left-most item
+				innerArr.push(M[i-1][j] + grid[i][j]);
+			} else { // Middle item
+				innerArr.push(Math.min(M[i-1][j-1], M[i-1][j]) + grid[i][j]);
+			}
+		}
+		M.push(innerArr);
+	}
+	return Math.min(...M[M.length - 1]);
+}
+
+
+/**
+ * Calculates n!
+ * @param {Number} n
+ * @returns {Number} n! = 1 * 2 * 3 * ... * (n-1) * n
+ */
+function factorial(n) {
+	if (n == 0 || n == 1) {
+		return 1;
+	}
+	return factorial(n - 1) * n;
+}
+
+
+/**
+ * Solves a "Unique Paths in a Grid I" contract problem
+ * @param {Number} rows
+ * @param {Number} cols
+ * @return {Number} The number of unique paths through a grid of the specified size.
+ */
+function solveGridPaths(rows, cols) {
+	const rightMoves = rows - 1;
+	const downMoves = cols - 1;
+	// To reach the end we must always make the same number of moves
+	return Math.round(factorial(rightMoves + downMoves) / (factorial(rightMoves) * factorial(downMoves)));
+}
+
+
+/**
+ * Solves a "Unique Paths in a Grid II" contract problem
+ * @param {Number[][]} grid The obstacle-filled grid to find paths through.
+ * @return {Number} The number of possible paths through the grid.
+ */
+function solveObstacleGridPaths(grid) {
+	// Dynamic Programming Approach, O(nm)
+	var M = [];
+	for (var i = 0; i < grid.length; i++) {
+		var innerArr = [];
+		for (var j = 0; j < grid[i].length; j++) {
+			innerArr.push(0);
+		}
+		M.push(innerArr);
+	}
+	M[0][0] = 1;
+	for (var i = 0; i < grid.length; i++) {
+		for (var j = 0; j < grid[i].length; j++) {
+			if (i == 0) {
+				var up = 0;
+			} else {
+				var up = M[i-1][j]
+			}
+			if (j == 0) {
+				var left = 0;
+			} else {
+				var left = M[i][j-1];
+			}
+			if (grid[i][j] == 1) {
+				M[i][j] = 0;
+			} else {
+				M[i][j] += up + left;
+			}
+		}
+	}
+	return M[M.length - 1][M[M.length - 1].length - 1];
+}
+
+
+/**
+ * Solves a "Find Largest Prime Factor" contract problem
+ * @param {Number} n The number to find the largest prime factor of
+ * @return {Number} The largest prime factor
+ */
+function solveLargestPrimeFactor(n) {
+	// Logical Approach, O(log n)
+	var factors = [];
+	var d = 2;
+	while (n > 1) {
+		while ((n % d) == 0) {
+			factors.push(d);
+			n /= d;
+		}
+		d++;
+		if ((d*d) > n) {
+			if (n > 1) {
+				factors.push(n);
+			}
+			break;
+		}
+	}
+	return Math.max(...factors);
+}
+
+
+/**
+ * Solves a "Spiralize Matrix" contract problem
+ * @param {any[][]} arr The array to spiralize
+ * @return {any[]} The result of spiralizing
+ */
+function solveSpiral(arr) {
+	// Traversal Approach, O(nm)
+	var result = [];
+	var rowStart = 0;
+	var colStart = 0;
+	var rowEnd = arr.length;
+	if (rowEnd == 0) {
+		return result;
+	}
+	var colEnd = arr[0].length;
+	if (colEnd == 0) {
+		return result;
+	}
+	while (rowEnd > rowStart && colEnd > colStart) {
+		for (var i = colStart; i < colEnd; i++) {
+			result.push(arr[rowStart][i]);
+		}
+		rowStart++;
+		if (rowStart >= rowEnd || colStart >= colEnd) {break;}
+		for (var i = rowStart; i < rowEnd; i++) {
+			result.push(arr[i][colEnd-1]);
+		}
+		colEnd--;
+		if (rowStart >= rowEnd || colStart >= colEnd) {break;}
+		for (var i = colEnd - 1; i >= colStart; i--) {
+			result.push(arr[rowEnd-1][i]);
+		}
+		rowEnd--;
+		if (rowStart >= rowEnd || colStart >= colEnd) {break;}
+		for (var i = rowEnd - 1; i >= rowStart; i--) {
+			result.push(arr[i][colStart]);
+		}
+		colStart++;
+	}
+	return result;
+}
+
+
+/**
+ * Solves a "Merge Overlapping Intervals" contract problem.
+ * @param {Number[][]} intervals Each interval should be like [start, end]
+ * @return {Number[][]} the given intervals, merged together where necessary, in ascending time order
+ */
+function solveOverlappingIntervals(intervals) {
+	// Greedy/logical approach, O(nlogn)
+	intervals = intervals.sort((a, b) => a[1] - b[1]); // Sort by earliest finish time first
+	for (var i = 0; i < (intervals.length - 1); i++) {
+		if (intervals[i+1][0] <= intervals[i][1]) {
+			intervals[i+1][0] = intervals[i][0];
+			intervals[i] = null;
+		}
+	}
+	var finalIntervals = [];
+	for (var i = 0; i < intervals.length; i++) {
+		let interval = intervals[i];
+		if (interval != null) {
+			finalIntervals.push(interval);
+		}
+	}
+	return finalIntervals;
+}
+
+
+/**
+ * Solves a "Find All Valid Math Expressions" contract problem.
+ * @param {String} str The string of numbers to use
+ * @param {Number} target The target value
+ * @returns {String[]} The list of all valid expressions from the numbers that result in the target.
+ */
+function solveValidMathExpressions(str, target) {
+	// Brute force approach, O(2^n)
+	const operations = ["+", "-", "*"]; // Not including concatenation
+	var values = [str[0]];
+	for (var i = 1; i < str.length; i++) {
+		var newValues = [];
+		for (var j = 0; j < values.length; j++) {
+			var value = values[j];
+			for (var k = 0; k < operations.length; k++) {
+				newValues.push(value.concat(operations[k]).concat(str[i]));
+			}
+			// Concatenate only if the resulting value would not have a leading zero.
+			if (value[value.length-1] == '0') {
+				var invalid = false;
+				for (var k = value.length - 1; k >= 0; k--) {
+					var letter = value[k];
+					if (operations.includes(letter)) {
+						invalid = true;
+						break;
+					}
+				}
+				if (!invalid) {
+					newValues.push(value.concat(str[i]));
+				}
+			} else {
+				newValues.push(value.concat(str[i]));
+			}
+		}
+		values = newValues;
+	}
+	var returnValues = [];
+	for (var i = 0; i < values.length; i++) {
+		var value = values[i];
+		if (eval(value) == target) {
+			returnValues.push(value);
+		}
+	}
+	return returnValues;
+}
+
+
+/**
+ * Solves a "Subarray with Maximum Sum" contract problem.
+ * @param {Number[]} arr
+ * @return {Number} The sum of the contiguous subarray with the maximum sum of size at least 1.
+ */
+function solveMaxSubarrySum(arr) {
+	// Brute force approach, O(n^2)
+	var maxVal = arr[0];
+	var maxArr = [arr[0]];
+	for (var i = 0; i < arr.length; i++) {
+		for (var j = 0; j < arr.length; j++) {
+			var currentArr = arr.slice(i, (i + j + 1));
+			var currentVal = currentArr.reduce((a, b) => (a + b), 0);
+			if (currentVal > maxVal) {
+				maxVal = currentVal;
+				maxArr = currentArr;
+			}
+		}
+	}
+	return maxArr.reduce((a, b) => (a + b), 0);
+}
+
+
+/**
+ * Solves a "Total Ways to Sum" contract problem.
+ * @param {Number} n The number to find the total ways to sum to.
+ * @return {Number} The total number of ways to sum to that number.
+ */
+function solveWaysToSum(n) {
+	// Dynamic programming approach, O(n)
+	var ways = [1];
+	for (var i = 0; i < n; i++) {
+		ways.push(0);
+	}
+	for (var i = 1; i < n; i++) {
+		for (var j = i; j <= n; j++) {
+			ways[j] += ways[j-i];
+		}
+	}
+	return ways[n];
+}
+
+
+/**
+ * Solves a "Array Jumping Game" contract problem.
+ * @param {Number[]} arr The array containing the jump information
+ * @return {Number} 1 if possible to exactly reach the end, 0 otherwise.
+ */
+function solveArrayJumpingGame(arr) {
+	var canReach = [0];
+	for (var i = 0; i < (arr.length - 1); i++) {
+		if (!canReach.includes(i)) {
+			continue;
+		}
+		for (var j = i; j <= Math.min(i + arr[i], arr.length - 1); j++) {
+			if (!canReach.includes(j)) {
+				canReach.push(j);
+			}
+		}
+	}
+	if (canReach.includes(arr.length - 1)) {
+		return 1;
+	} else {
+		return 0;
+	}
+}
+
+
+/**
+ * Solves a "Generate IP Addresses" contract problem.
+ * @param {String} str The string containing the numbers that will make up the generated IP addresses
+ * @return {String[]} The generated IP addresses
+ */
+function solveGenerateIPAddresses(str) {
+	var possibleIPs = [["", str]];
+	for (var i = 0; i < 4; i++) {
+		var newPossibleIPs = [];
+		for (var j = 0; j < possibleIPs.length; j++) {
+			var possibility = possibleIPs[j];
+			var currentAddr = possibility[0];
+			var remainingAddr = possibility[1];
+			if (remainingAddr.length >= 1 && remainingAddr.length <= (3 - i) * 3 + 1) {
+				newPossibleIPs.push([currentAddr + "." + remainingAddr.substring(0,1), remainingAddr.substring(1)]);
+			}
+			if (remainingAddr[0] == '0') {
+				continue; // 0 can only be on its own, it cannot be the first number in an octet.
+			}
+			if (remainingAddr.length >= 2 && remainingAddr.length <= (3 - i) * 3 + 2) {
+				newPossibleIPs.push([currentAddr + "." + remainingAddr.substring(0, 2), remainingAddr.substring(2)]);
+			}
+			if (remainingAddr.length >= 3 && remainingAddr.length <= (4 - i) * 3 && parseInt(remainingAddr.substring(0,3)) <= 255) {
+				newPossibleIPs.push([currentAddr + "." + remainingAddr.substring(0, 3), remainingAddr.substring(3)]);
+			}
+		}
+		possibleIPs = newPossibleIPs;
+	}
+	// Remove the . at the start of all generated IP addresses and return them.
+	return possibleIPs.map((a) => a[0].substring(1));
+}
+
+
+/**
+ * Returns all unique permutations of the given string with the specified number of letters removed
+ * @param {String} str The string to remove from
+ * @param {Number} n The number of letters to remove from the string
+ */
+function removedPermutations(str, n) {
+	if (n == 0) {
+		return [str];
+	}
+	var uniquePerms = [];
+	for (var i = str.length - 1; i >= 0; i--) {
+		var removedPerms = removedPermutations(str.substring(0,i) + str.substring(i+1), n - 1);
+		for (var j = 0; j < removedPerms.length; j++) {
+			var perm = removedPerms[j];
+			if (!uniquePerms.includes(perm)) {
+				uniquePerms.push(perm);
+			}
+		}
+	}
+	return uniquePerms;
+}
+
+
+/**
+ * Solves a "Sanitize Parentheses in Expression" contract problem.
+ * @param {String} str The string expression to sanitize parentheses in
+ * @returns {String[]} All sanitized expressions using the minimal amount of letter removals.
+ */
+function solveSanitizeExpression(str) {
+	// Brute force approach, O(n!)
+	for (var i = 0; i <= str.length; i++) {
+		var permutations = removedPermutations(str, i); // TODO lots of repeat calculations here to avoid if possible
+		var solutions = [];
+		for (var j = 0; j < permutations.length; j++) {
+			var perm = permutations[j];
+			var openParentheses = 0;
+			var isSanitized = true;
+			// For each possible solution, check if valid.
+			for (var k = 0; k < perm.length; k++) {
+				var letter = perm[k];
+				if (letter == '(') {
+					openParentheses++;
+				} else if (letter == ')') {
+					if (openParentheses == 0) {
+						isSanitized = false; // If closing an unopened parentheses, not a valid expression.
+						break;
+					} else {
+						openParentheses--;
+					}
+				}
+			}
+			if (openParentheses != 0) { 
+				isSanitized = false; // If unclosed parentheses, not a valid expression
+			}
+			if (isSanitized) { // Find all minimum-removal sanitized expressions, not just the first
+				solutions.push(perm);
+			}
+		}
+		if (solutions.length != 0) {
+			break;
+		}
+	}
+	return solutions;
+}
+
+
+/**
+ * Solves a given contract on a given server.
+ * @param {NS} ns
+ * @param {String} server
+ * @param {String} contract
+ * @return {Boolean} success
+ */
+function solveContract(ns, server, contract) {
+	// Only attempt the contract if we have not yet attempted it.
+	if (failedContracts.includes(`${server}:${contract}`)) {
+		return false;
+	}
+	// Parse the contract data and run it with the relevant solving algorithm.
+	try {
+		const type = ns.codingcontract.getContractType(contract, server);
+		const data = ns.codingcontract.getData(contract, server);
+		let solution = "";
+		switch (type) {
+			case "Algorithmic Stock Trader I":
+				solution = solveMaxStockProfit(1, data);
+				break;
+			case "Algorithmic Stock Trader II":
+				solution = solveMaxStockProfit(Math.ceil(data.length / 2), data);
+				break;
+			case "Algorithmic Stock Trader III":
+				solution = solveMaxStockProfit(2, data);
+				break;
+			case "Algorithmic Stock Trader IV":
+				let maxTrades = data[0];
+				let stockPrices = data[1];
+				solution = solveMaxStockProfit(maxTrades, stockPrices);
+				break;
+			case "Minimum Path Sum in a Triangle":
+				solution = solveMinimumTrianglePath(data);
+				break;
+			case "Unique Paths in a Grid I":
+				let rows = data[0];
+				let cols = data[1];
+				solution = solveGridPaths(rows, cols);
+				break;
+			case "Unique Paths in a Grid II":
+				solution = solveObstacleGridPaths(data);
+				break;
+			case "Find Largest Prime Factor":
+				solution = solveLargestPrimeFactor(data);
+				break;
+			case "Spiralize Matrix":
+				solution = solveSpiral(data);
+				break;
+			case "Merge Overlapping Intervals":
+				solution = solveOverlappingIntervals(data);
+				break;
+			case "Find All Valid Math Expressions":
+				let str = data[0];
+				let target = data[1];
+				solution = solveValidMathExpressions(str, target);
+				break;
+			case "Subarray with Maximum Sum":
+				solution = solveMaxSubarrySum(data);
+				break;
+			case "Total Ways to Sum":
+				solution = solveWaysToSum(data);
+				break;
+			case "Array Jumping Game":
+				solution = solveArrayJumpingGame(data);
+				break;
+			case "Generate IP Addresses":
+				solution = solveGenerateIPAddresses(data);
+				break;
+			case "Sanitize Parentheses in Expression":
+				solution = solveSanitizeExpression(data);
+				break;
+			default:
+				logMessage(ns, `WARN - Unknown contract type ${type} needs adding to the contract solver.`);
+				return false;
+		}
+		//var options = new ns.CodingAttemptOptions();
+		//options.returnReward = true;
+		//var reward = ns.codingcontract.attempt(solution, contract, server, options);
+		var reward = ns.codingcontract.attempt(solution, contract, server, [true]);
+		var success = (reward != "");
+		if (success) {
+			logMessage(ns, `Contract SUCCESS: ${server}:${contract} (${type}). Reward: ${reward}`);
+		} else {
+			logMessage(ns, `ERROR - Contract FAILED: ${server}:${contract} (${type})`);
+			failedContracts.push(`${server}:${contract}`)
+		}
+		return success;
+	} catch (err) {
+		// In the case of failure, record and log the failure.
+		logMessage(ns, `ERROR - Contract FAILED: ${server}:${contract}`);
+		failedContracts.push(`${server}:${contract}`)
+		return false;
+	}
+}
+
+
+
+/**
+ * Solves all contracts on a list of given servers.
+ * @param {NS} ns
+ * @param {String[]} servers
+ * @returns {Number} The number of solved contracts.
+ */
+function solveContracts(ns, servers) {
+	var solved = 0;
+	for (var i = 0; i < servers.length; i++) {
+		var server = servers[i];
+		var contracts = ns.ls(server, ".cct");
+		for (var j = 0; j < contracts.length; j++) {
+			var contract = contracts[j];
+			if (solveContract(ns, server, contract)) {
+				solved++;
+			}
+		}
+	}
+	return solved;
+}
+
+
+/**
+ * Purchases a server of the specified size.
+ * @param {NS} ns
+ * @param {Number} size
+ */
+function purchaseServer(ns, size) {
+	let purchased = ns.getPurchasedServers();
+	if (purchased.length >= ns.getPurchasedServerLimit()) {
+		return;
+	}
+	let serverName = `server-${purchased.length}-${size}GB`;
+	ns.purchaseServer(serverName, size);
+	logMessage(ns, `INFO - Purchased server of size ${size}. Now have ${purchased.length + 1} servers.`);
+}
+
+
+/** 
+ * @param {NS} ns 
+ *    > {int} arg1 = depth to BFS search for servers
+ *    > {boolean} arg2 = silent mode (no terminal messages or toasts, only log messages).
+ *    > {boolean} arg3 = greedy mode (prioritise servers with available money, even if not the best)
+ *    > {boolean} arg4 = very greedy mode (always hack, never grow/weaken - 'I need money now')
+ **/
+export async function main(ns) {
+	ns.disableLog("ALL");
+	// Check required information exists before running
+	for (let i = 0; i < requiredScripts.length; i++) {
+		var script = requiredScripts[i];
+		if (!ns.fileExists(script, "home")) {
+			logMessage(ns, `ERROR - Required script ${script} not found in home.`);
+			return;
+		}
+	}
+	// Startup functionality
+	for (let i = 0; i < remoteScripts.length; i++) {
+		let script = remoteScripts[i];
+		scriptRam.set(script, ns.getScriptRam(script) + ramTolerance);
+	}
+	parseArgs(ns.args);
+	logMessage(ns, "INFO - Parsed input arguments. Starting system management.");
+
+	var prevTime = 0;
+	var timeLastChecked = 0;
+	var rootedServers = [];
+	var availableRam = new Map();
+	//var totalRam = 0;
+	//var usedRam = 0; // TODO COMEHERE
+	var targets = []; // Each item is [targetname, moneyThreshold, securityThreshold]
+	var targetInfo = new Map(); // Each key is a target and each value is [script, requiredScripts, ranScripts, finishedScripts]
+	var runCount = 0;
+	var runningScripts = [];
+	// Infinite loop of required processing.
+	while (true) {
+		// Sleep to match appropriate loop time
+		let currTime = getCurrentTime();
+		let timePassed = currTime - prevTime;
+		if (timePassed < loopTime) {
+			await ns.sleep(loopTime - timePassed);
+			currTime = getCurrentTime();
+			prevTime = currTime
+		} else {
+			prevTime = currTime;
+		}
+		// Check for and record finished scripts
+		for (let i = runningScripts.length - 1; i >= 0; i--) {
+			let info = runningScripts[i];
+			let server = info[0];
+			let runThreads = info[1];
+			let script = info[2];
+			let target = info[3];
+			let runCount = info[4];
+			if (!ns.isRunning(script, server, target, runCount)) {
+				let targetStats = targetInfo.get(target);
+				let requiredScripts = targetStats[1];
+				let ranScripts = targetStats[2];
+				let finishedScripts = targetStats[3] + runThreads;
+				if (requiredScripts == ranScripts && ranScripts == finishedScripts) {
+					targetInfo.set(target, ["", 0, 0, 0]);
+				} else {
+					targetInfo.set(target, [script, requiredScripts, ranScripts, finishedScripts]);
+				}
+				availableRam.set(server, availableRam.get(server) + scriptRam.get(script) * runThreads);
+				runningScripts.splice(i, 1);
+			}
+		}
+		// Check whether to scan for new servers or perform other flagged actions.
+		let timeSinceLastCheck = currTime - timeLastChecked;
+		let flaggedForUpdate = ns.isRunning("flag-sys-update.ns", "home");
+		let flaggedForSettings = false;
+		let settingArgs = null;
+		let runningProcesses = ns.ps("home");
+		for (let i = 0; i < runningProcesses.length; i++) {
+			let process = runningProcesses[i];
+			if (process.filename == "flag-sys-settings.ns") {
+				flaggedForSettings = true;
+				settingArgs = process.args;
+				break;
+			}
+		}
+		let flaggedForEnd = ns.isRunning("flag-sys-end.ns");
+
+		if (flaggedForSettings) {
+			// Load relevant settings
+			parseArgs(settingArgs);
+			logMessage(ns, `INFO - Loaded given settings: ${settingArgs}`);
+			ns.exec("flag-received.ns", "home", 1, "flag-sys-settings.ns");
+		} else if (flaggedForEnd) {
+			logMessage(ns, `INFO - Flagged to end operation.`);
+			// Kill all scripts being used by the program
+			for (let i = 0; i < runningScripts.length; i++) {
+				let info = runningScripts[i];
+				let server = info[0];
+				let script = info[2];
+				let target = info[3];
+				let runCount = info[4];
+				if (ns.isRunning(script, server, target, runCount)) {
+					ns.kill(script, server, target, runCount);
+				}
+			}
+			ns.exec("flag-received.ns", "home", 1, "flag-sys-end.ns");
+			return;
+		} else if (timeSinceLastCheck > checkTime || flaggedForUpdate) {
+			if (flaggedForUpdate) {
+				logMessage(ns, `INFO - Flagged to manually update.`);
+				ns.exec("flag-received.ns", "home", 1, "flag-sys-update.ns");
+			}
+			// Scan for new servers and update respective information.
+			timeLastChecked = currTime;
+			let servers = getServers(ns);
+			rootedServers = await tryRootServers(ns, servers);
+			let solvedContracts = solveContracts(ns, servers);
+			toastMessage(ns, `Found ${rootedServers.length} servers to manage. Solved ${solvedContracts} contracts.`);
+			logMessage(ns, `INFO - Updated. Found ${rootedServers.length} servers to manage. Solved ${solvedContracts} contracts.`);
+			availableRam = getAvailableRam(ns, availableRam, rootedServers);
+		}
+
+		// Compute best target ordering and relevant threshold information
+		targets = getTargets(ns, rootedServers);
+		// Find the scripts to run on the retrieved targets
+		var currentTarget = 0;
+		var scriptInfo = [];
+		while (currentTarget < targets.length) {
+			// Parse target information
+			let targetCalcs = targets[currentTarget];
+			let target = targetCalcs[0];
+			let moneyThresh = targetCalcs[1];
+			let securityThresh = targetCalcs[2];
+			// Check whether target analysis is actually needed
+			let targetStats = targetInfo.get(target);
+			if (targetStats === undefined) {
+				targetStats = ["", 0, 0, 0];
+				targetInfo.set(target, targetStats);
+			}
+			let script = targetStats[0];
+			let requiredScripts = targetStats[1];
+			let ranScripts = targetStats[2];
+			if (requiredScripts != 0) {
+				// If the number of required scripts it already calculated but the target is not saturated, queue leftover scripts.
+				if (ranScripts != requiredScripts) {
+					scriptInfo.push([target, script, requiredScripts - ranScripts]);
+				}
+				currentTarget++;
+				continue;
+			}
+			// If the number of required scripts is not yet calculated, calculate and enqueue them.
+			let toRun = 0;
+			// Check security and money levels to determine whether to weaken, grow or hack the target, and using how many threads.
+			let securityLevel = ns.getServerSecurityLevel(target);
+			let moneyAvailable = ns.getServerMoneyAvailable(target);
+			if (securityLevel > securityThresh && !veryGreedy) {
+				let securityDiff = securityLevel - securityThresh;
+				toRun = Math.ceil(securityDiff * actionTolerance / 0.05);
+				script = weakScript;
+			} else if (moneyAvailable < moneyThresh && !veryGreedy) {
+				if (moneyAvailable == 0) {
+					moneyAvailable = 1;
+				}
+				let requiredGrowth = moneyThresh / moneyAvailable; // TODO growthAnalyze takes cores???
+				toRun = Math.ceil(ns.growthAnalyze(target, requiredGrowth, 1) * actionTolerance);
+				script = growScript;
+			} else {
+				let percentToHack = moneyAvailable / ns.getServerMaxMoney(target) - hackTolerance;
+				toRun = Math.ceil(actionTolerance * 1.5 * percentToHack / (ns.hackAnalyze(target) * ns.hackAnalyzeChance(target))); // TODO lmao what actually is this estimate???
+				script = hackScript;
+			}
+			if (toRun > 0) {
+				targetInfo.set(target, [script, toRun, 0, 0]); // Record calculated values
+				scriptInfo.push([target, script, toRun]); // Enqueue required scripts
+			} else if (!veryGreedy) {
+				logMessage(ns, `WARN - The script calculated that it needs to run ${toRun} threads of the script ${script} for target ${target} - this is abnormal behaviour under normal conditions. Pehaps your moneyThresh value is set too low?`);
+			}
+			currentTarget++;
+		}
+		// Run target scripts on available servers
+		let currentScript = 0;
+		let ranThreadCount = 0; 
+		for (let i = 0; i < rootedServers.length; i++) {
+			if (currentScript >= scriptInfo.length) {
+				break;
+			}
+			let failure = false;
+			let server = rootedServers[i];
+			let script = scriptInfo[currentScript][1];
+			// For each server, keep handling target scripts until no space is left or all scripts are handled.
+			while (availableRam.get(server) >= scriptRam.get(script) && !failure && scriptInfo.length > 0 && currentScript < scriptInfo.length) {
+				let scriptToRun = scriptInfo[currentScript];
+				let target = scriptToRun[0];
+				script = scriptToRun[1];
+				// Find the number of threads to run on the server
+				let targetThreads = scriptToRun[2];
+				let remainingThreads = targetThreads - ranThreadCount;
+				let maxThreads = Math.floor(availableRam.get(server) / scriptRam.get(script));
+				let runThreads = Math.min(remainingThreads, maxThreads);
+				// Attempt to run the script.
+				if (ns.exec(script, server, runThreads, target, runCount) > 0) {
+					// Update the amount of available RAM, list of running scripts, counts of running scripts, saturation status and more.
+					ranThreadCount += runThreads;
+					availableRam.set(server, availableRam.get(server) - scriptRam.get(script) * runThreads);
+					runningScripts.push([server, runThreads, script, target, runCount]);
+					let targetStats = targetInfo.get(target);
+					script = targetStats[0];
+					let requiredScripts = targetStats[1];
+					let ranScripts = targetStats[2] + runThreads;
+					let finishedScripts = targetStats[3];
+					targetInfo.set(target, [script, requiredScripts, ranScripts, finishedScripts]);
+					if (ranScripts == requiredScripts) { // We have ran the target number of scripts, so move on to the next target
+						currentScript++;
+						ranThreadCount = 0;
+					}
+					runCount++;
+				} else {
+					// Record and log failure
+					failure = true;
+					logMessage(ns, `ERROR - Script execution failure: ${server} failed to exec ${script} ${target} ${runCount} with ${runThreads} threads. Expected RAM = ${availableRam.get(server)}GB, actual RAM = ${ns.getServerMaxRam(server) - ns.getServerUsedRam(server)}GB. Running ${ns.ps(server).length} processes: ${ns.ps(server).map(function(p) {return `${p.filename} ${p.args}`;}).join(", ")}`);
+				}
+			}
+		}
+	}
+}

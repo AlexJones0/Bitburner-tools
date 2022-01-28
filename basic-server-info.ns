@@ -1,0 +1,7 @@
+/** @param {NS} ns **/
+export async function main(ns) {
+    let maxMoney = ns.getServerMaxMoney(ns.args[0]);
+	ns.tprint("Max money: " + maxMoney);
+	let availableMoney = ns.getServerMoneyAvailable(ns.args[0]);
+	ns.tprint("Available money: " + availableMoney + " (" + (availableMoney / maxMoney * 100).toPrecision(4) + "%)");
+}
